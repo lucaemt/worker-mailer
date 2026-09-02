@@ -12,7 +12,8 @@ Worker Mailer is an SMTP client that runs on Cloudflare Workers. It leverages [C
 - 🚀 Completely built on the Cloudflare Workers runtime with no other dependencies
 - 📝 Full TypeScript type support
 - 📧 Supports sending plain text and HTML emails with attachments
-- 🔒 Supports multiple SMTP authentication methods: `plain`, `login`, and `CRAM-MD5`
+- 🔒 Supports multiple SMTP authentication methods: `plain`, `login`, `CRAM-MD5` and `XOAUTH2`
+- ⚡ Uses SMTP `PIPELINING` so a message with many recipients costs two round trips instead of one per recipient
 - 📅 DSN support
 
 ## Table of Contents
@@ -54,6 +55,9 @@ const mailer = await WorkerMailer.connect({
   host: 'smtp.acme.com',
   port: 587,
   secure: true,
+  // The name announced in EHLO. Receiving servers score it — set it to a domain
+  // you control, otherwise the connection announces itself as `[127.0.0.1]`.
+  ehloName: 'acme.com',
 })
 
 // Send email
@@ -103,19 +107,26 @@ type WorkerMailerOptions = {
   port: number // SMTP server port (usually 587 or 465)
   secure?: boolean // Use TLS (default: false)
   startTls?: boolean // Upgrade to TLS if SMTP server supports (default: true)
+  requireTls?: boolean // Fail instead of sending unencrypted (default: false)
+  ehloName?: string // Name announced in EHLO (default: '[127.0.0.1]')
   credentials?: {
     // SMTP authentication credentials
     username: string
-    password: string
+    password?: string // Required for plain, login and cram-md5
+    accessToken?: string // Required for xoauth2
   }
   authType?:
     | 'plain'
     | 'login'
     | 'cram-md5'
-    | Array<'plain' | 'login' | 'cram-md5'>
+    | 'xoauth2'
+    | Array<'plain' | 'login' | 'cram-md5' | 'xoauth2'>
   logLevel?: LogLevel // Logging level (default: LogLevel.INFO)
-  socketTimeoutMs?: number // Socket timeout in milliseconds
-  responseTimeoutMs?: number // Server response timeout in milliseconds
+  socketTimeoutMs?: number // Socket timeout in milliseconds (default: 60000)
+  responseTimeoutMs?: number // Server response timeout in milliseconds (default: 30000)
+  pipelining?: boolean // Batch MAIL/RCPT when the server supports it (default: true)
+  chunking?: boolean // Transfer with BDAT when the server supports it (default: false)
+  allowPartialRecipients?: boolean // Deliver even if some recipients are rejected (default: false)
   dsn?: {
     RET?: {
       HEADERS?: boolean
@@ -129,6 +140,38 @@ type WorkerMailerOptions = {
   }
 }
 ```
+
+#### `ehloName`
+
+Every SMTP session opens by announcing a name. Receiving servers feed that name
+into their spam scoring, and some reject a name that is not a fully qualified
+domain. Set it to a domain you control:
+
+```typescript
+await WorkerMailer.connect({ host, port, ehloName: 'mail.acme.com' })
+```
+
+A bare IP address is wrapped in the address literal syntax RFC 5321 requires, so
+`'203.0.113.7'` is announced as `[203.0.113.7]`.
+
+#### `requireTls`
+
+By default the client upgrades to TLS when the server offers `STARTTLS` and
+otherwise authenticates over a plaintext connection. Set `requireTls: true` to
+fail the connection instead.
+
+#### `pipelining` and `chunking`
+
+`pipelining` sends `MAIL FROM` and every `RCPT TO` as a single batch when the
+server advertises `PIPELINING` (RFC 2920), which is what virtually every server
+does. A message to 20 recipients then costs two round trips instead of 22. Turn
+it off only to debug against a server that mishandles it.
+
+`chunking` transfers the message with `BDAT` (RFC 3030) instead of `DATA` when
+the server advertises `CHUNKING`. Because the message is length delimited it
+needs no dot-stuffing pass, which is worthwhile for large attachments. It is off
+by default because far less mail traffic goes through `BDAT` than through
+`DATA`.
 
 ### mailer.send(options)
 
@@ -181,9 +224,13 @@ type EmailOptions = {
   text?: string // Plain text content
   html?: string // HTML content
   headers?: Record<string, string> // Custom email headers
-  attachments?: { filename: string; content: string; mimeType?: string }[] // Attachments, content must be base64-encoded, it will try to infer mimeType if not set
-  dsnOverride?: // overrides dsn defined in WorkerMailer, if not set, it will take the WorkerMailer-Option.
-  {
+  attachments?: {
+    filename: string
+    // Base64 string, or raw bytes which are base64-encoded for you
+    content: string | ArrayBuffer | Uint8Array
+    mimeType?: string // Inferred from the filename if not set
+  }[]
+  dsnOverride?: { // overrides dsn defined in WorkerMailer, if not set, it will take the WorkerMailer-Option.
     envelopeId?: string | undefined
     RET?: {
       HEADERS?: boolean
@@ -197,6 +244,43 @@ type EmailOptions = {
   }
 }
 ```
+
+#### Return value
+
+`send()` resolves with the outcome of the transaction:
+
+```typescript
+type SendResult = {
+  accepted: User[] // Recipients the server accepted
+  rejected: { user: User; response: string }[] // Recipients it rejected, with the response
+  response: string // The server's final response to the message
+}
+```
+
+By default a single rejected recipient fails the whole message and `send()`
+rejects, so `rejected` is only ever populated when `allowPartialRecipients` is
+set:
+
+```typescript
+const mailer = await WorkerMailer.connect({
+  host,
+  port,
+  allowPartialRecipients: true,
+})
+const { accepted, rejected } = await mailer.send({ from, to, subject, text })
+if (rejected.length) {
+  console.warn(
+    'Not delivered to',
+    rejected.map(r => r.user.email),
+  )
+}
+```
+
+#### Bcc
+
+`bcc` recipients are sent in the SMTP envelope only and never written into the
+message, so the other recipients cannot see them. If you deliberately want a
+`Bcc` header in the message, set it yourself through `headers`.
 
 ### Static Method: WorkerMailer.send()
 

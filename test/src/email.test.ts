@@ -2,6 +2,22 @@ import { describe, it, expect } from 'vitest'
 import { Email, type EmailOptions, encodeHeader } from '../../src/email'
 import { extract } from 'letterparser'
 
+/**
+ * Turns SMTP wire data back into the message an SMTP server would hand to a
+ * MIME parser: the trailing CRLF belongs to the `CRLF.CRLF` terminator, and
+ * dot-stuffing is undone by the server.
+ */
+function toMessage(data: string): string {
+  const terminator = data.lastIndexOf('\r\n.\r\n')
+  const message = terminator === -1 ? data : data.slice(0, terminator)
+  return message.replace(/\r\n\.\./g, '\r\n.')
+}
+
+/** Undoes RFC 5322 header folding so a header can be read as one line. */
+function unfold(data: string): string {
+  return data.replace(/\r\n[ \t]+/g, ' ')
+}
+
 describe('Email', () => {
   describe('constructor', () => {
     it('should create an email with minimal options', () => {
@@ -58,7 +74,7 @@ describe('Email', () => {
         text: 'Hello World',
       })
       const data = email.getEmailData()
-      const msg = extract(data)
+      const msg = extract(toMessage(data))
       expect(msg.text).toBe('Hello World')
       expect(msg.subject).toBe('Test Subject')
       expect(msg.from).toEqual({
@@ -101,12 +117,12 @@ describe('Email', () => {
         html: `<p>${'Hello, this is a test email with a long text. '.repeat(50)}</p>`,
       })
       const data = email.getEmailData()
-      
+
       // Note: letterparser doesn't perform SMTP dot-unstuffing (that's done by SMTP servers)
       // So we need to manually remove dot-stuffing before parsing to simulate what an SMTP server would do
       const unstuffedData = data.replace(/\r\n\.\./g, '\r\n.')
       const msg = extract(unstuffedData)
-      
+
       // expect the text to be the same if linebreaks are removed (we are adding a space and removing all double spaces due to the way the text is wrapped)
       expect(msg.text!.replace(/\n/g, ' ').replaceAll('  ', ' ')).toBe(
         'Hello, this is a test email with a long text. '.repeat(50).trim(),
@@ -123,7 +139,7 @@ describe('Email', () => {
       }
     })
 
-    it('should include CC and BCC headers when provided', () => {
+    it('should include a CC header but never a BCC header', () => {
       const email = new Email({
         from: 'sender@example.com',
         to: 'recipient@example.com',
@@ -134,7 +150,7 @@ describe('Email', () => {
         text: 'Hello World',
       })
       const data = email.getEmailData()
-      const msg = extract(data)
+      const msg = extract(toMessage(data))
       expect(msg.cc).toEqual([
         { address: 'cc1@example.com', raw: 'cc1@example.com' },
         {
@@ -143,9 +159,15 @@ describe('Email', () => {
           raw: '"CC2" <cc2@example.com>',
         },
       ])
-      expect(msg.bcc).toEqual([
-        { address: 'bcc@example.com', raw: 'bcc@example.com' },
-      ])
+
+      // Bcc belongs in the envelope only. Writing it into the message shows
+      // every recipient who was blind-copied.
+      expect(msg.bcc).toBeUndefined()
+      expect(data.toLowerCase()).not.toContain('bcc:')
+      expect(data).not.toContain('bcc@example.com')
+      expect(email.recipients.map(user => user.email)).toContain(
+        'bcc@example.com',
+      )
     })
 
     it('should include Reply-To when provided', () => {
@@ -321,8 +343,9 @@ describe('Email', () => {
       })
 
       const emailData = email.getEmailData()
-      // Extract the To header from the raw email data
-      const toHeader = emailData
+      // Two encoded display names exceed 78 characters, so the header is folded
+      // across two lines and has to be joined again before it can be read.
+      const toHeader = unfold(emailData)
         .split('\r\n')
         .find(line => line.toLowerCase().startsWith('to:'))
       expect(toHeader).toBeDefined()
@@ -372,6 +395,273 @@ describe('Email', () => {
         },
       },
     ])
+  })
+
+  describe('MIME structure', () => {
+    const base = {
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Test Subject',
+    }
+
+    it('should not wrap a text-only email in multipart', () => {
+      const data = new Email({ ...base, text: 'Hello World' }).getEmailData()
+      expect(data).toContain('Content-Type: text/plain; charset="UTF-8"')
+      expect(data).not.toContain('multipart')
+    })
+
+    it('should not wrap an html-only email in multipart', () => {
+      const data = new Email({ ...base, html: '<p>Hi</p>' }).getEmailData()
+      expect(data).toContain('Content-Type: text/html; charset="UTF-8"')
+      expect(data).not.toContain('multipart')
+    })
+
+    it('should use multipart/alternative without attachments', () => {
+      const data = new Email({
+        ...base,
+        text: 'Hello',
+        html: '<p>Hello</p>',
+      }).getEmailData()
+      expect(data).toContain('Content-Type: multipart/alternative')
+      expect(data).not.toContain('multipart/mixed')
+    })
+
+    it('should use multipart/mixed once an attachment is present', () => {
+      const data = new Email({
+        ...base,
+        text: 'Hello',
+        attachments: [{ filename: 'a.txt', content: 'QQ==' }],
+      }).getEmailData()
+      expect(data).toContain('Content-Type: multipart/mixed')
+    })
+  })
+
+  describe('transfer encoding', () => {
+    const base = {
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Test Subject',
+    }
+
+    it('should send plain ASCII as 7bit without re-encoding it', () => {
+      const data = new Email({
+        ...base,
+        text: 'Hello World, nothing to encode here.',
+      }).getEmailData()
+      expect(data).toContain('Content-Transfer-Encoding: 7bit')
+      expect(data).toContain('Hello World, nothing to encode here.')
+    })
+
+    it('should prefer base64 over quoted-printable for CJK content', () => {
+      const text = '你好世界'.repeat(20)
+      const data = new Email({ ...base, text }).getEmailData()
+      expect(data).toContain('Content-Transfer-Encoding: base64')
+      // quoted-printable needs 9 characters per CJK character, base64 needs 4
+      const qpSize = new TextEncoder().encode(text).length * 3
+      expect(data.length).toBeLessThan(qpSize)
+    })
+
+    it('should still use quoted-printable for mostly-ASCII content', () => {
+      const data = new Email({
+        ...base,
+        text: `${'a'.repeat(2000)} ümlaut`,
+      }).getEmailData()
+      expect(data).toContain('Content-Transfer-Encoding: quoted-printable')
+    })
+
+    it('should use 8bit when the server advertised 8BITMIME', () => {
+      const data = new Email({ ...base, text: '你好世界' }).getEmailData({
+        allow8bit: true,
+      })
+      expect(data).toContain('Content-Transfer-Encoding: 8bit')
+      expect(data).toContain('你好世界')
+    })
+
+    it('should not use 8bit for lines that could exceed the octet limit', () => {
+      const data = new Email({
+        ...base,
+        text: '你好世界'.repeat(100),
+      }).getEmailData({ allow8bit: true })
+      expect(data).not.toContain('Content-Transfer-Encoding: 8bit')
+    })
+  })
+
+  describe('header safety', () => {
+    it('should not let a subject inject additional headers', () => {
+      const data = new Email({
+        from: 'sender@example.com',
+        to: 'recipient@example.com',
+        subject: 'Payment\r\nBcc: attacker@evil.com',
+        text: 'Hello',
+      }).getEmailData()
+
+      const headerLines = data.slice(0, data.indexOf('\r\n\r\n')).split('\r\n')
+      expect(
+        headerLines.some(line => line.toLowerCase().startsWith('bcc:')),
+      ).toBe(false)
+      // The CRLF is encoded rather than written to the wire
+      expect(data).toContain('=0D=0A')
+    })
+
+    it('should not let a display name inject additional headers', () => {
+      const data = new Email({
+        from: { name: 'Bob\r\nBcc: attacker@evil.com', email: 'bob@acme.com' },
+        to: 'recipient@example.com',
+        subject: 'Test',
+        text: 'Hello',
+      }).getEmailData()
+
+      const headerLines = data.slice(0, data.indexOf('\r\n\r\n')).split('\r\n')
+      expect(
+        headerLines.some(line => line.toLowerCase().startsWith('bcc:')),
+      ).toBe(false)
+    })
+
+    it('should fold a long recipient list instead of exceeding 998 octets', () => {
+      const to = Array.from({ length: 60 }, (_, i) => ({
+        email: `user${i}@example.com`,
+      }))
+      const data = new Email({
+        from: 'sender@example.com',
+        to,
+        subject: 'Test',
+        text: 'Hello',
+      }).getEmailData()
+
+      for (const line of data.split('\r\n')) {
+        expect(line.length).toBeLessThanOrEqual(998)
+      }
+      const toHeader = unfold(data)
+        .split('\r\n')
+        .find(line => line.startsWith('To: '))
+      expect(toHeader).toContain('user0@example.com')
+      expect(toHeader).toContain('user59@example.com')
+    })
+
+    it('should use the RFC 5322 date format instead of GMT', () => {
+      const data = new Email({
+        from: 'sender@example.com',
+        to: 'recipient@example.com',
+        subject: 'Test',
+        text: 'Hello',
+      }).getEmailData()
+
+      const dateHeader = data
+        .split('\r\n')
+        .find(line => line.startsWith('Date: '))
+      expect(dateHeader).toMatch(
+        /^Date: (Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} \+0000$/,
+      )
+    })
+
+    it('should keep every encoded-word within 75 characters', () => {
+      const result = encodeHeader('你好'.repeat(50))
+      expect(result.split(' ').length).toBeGreaterThan(1)
+      for (const word of result.split(' ')) {
+        expect(word.length).toBeLessThanOrEqual(75)
+      }
+    })
+  })
+
+  describe('attachments', () => {
+    const base = {
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Test Subject',
+      text: 'Hello World',
+    }
+
+    it('should accept raw bytes and base64-encode them', () => {
+      const data = new Email({
+        ...base,
+        attachments: [
+          {
+            filename: 'test.txt',
+            content: new TextEncoder().encode('Test content'),
+          },
+        ],
+      }).getEmailData()
+
+      const msg = extract(toMessage(data))
+      expect(msg.attachments?.[0].body).toBe('Test content')
+    })
+
+    it('should accept an ArrayBuffer', () => {
+      const bytes = new TextEncoder().encode('Test content')
+      const data = new Email({
+        ...base,
+        attachments: [
+          {
+            filename: 'test.txt',
+            content: bytes.buffer.slice(
+              bytes.byteOffset,
+              bytes.byteOffset + bytes.byteLength,
+            ),
+          },
+        ],
+      }).getEmailData()
+
+      const msg = extract(toMessage(data))
+      expect(msg.attachments?.[0].body).toBe('Test content')
+    })
+
+    it('should encode large attachments in 76 character lines', () => {
+      // Larger than the 5472 byte slice the encoder works in, so the base64 of
+      // the slices has to line up exactly with the base64 of the whole file.
+      const content = new Uint8Array(20_000)
+      for (let i = 0; i < content.length; i++) {
+        content[i] = i % 251
+      }
+      const data = new Email({
+        ...base,
+        attachments: [{ filename: 'big.bin', content }],
+      }).getEmailData()
+
+      const base64Lines = data
+        .split('\r\n')
+        .filter(line => /^[A-Za-z0-9+/]{40,}={0,2}$/.test(line))
+      expect(base64Lines.length).toBeGreaterThan(300)
+      for (const line of base64Lines) {
+        expect(line.length).toBeLessThanOrEqual(76)
+      }
+      expect(base64Lines[0].length).toBe(76)
+
+      const decoded = atob(base64Lines.join(''))
+      expect(decoded.length).toBe(content.length)
+      expect(decoded.charCodeAt(19_999)).toBe(content[19_999])
+    })
+
+    it('should encode a non-ASCII filename per RFC 2231', () => {
+      const data = new Email({
+        ...base,
+        attachments: [{ filename: 'Rechnung Ü.pdf', content: 'QQ==' }],
+      }).getEmailData()
+
+      expect(data).toContain("filename*=UTF-8''Rechnung%20%C3%9C.pdf")
+      expect(data).not.toContain('filename="Rechnung Ü.pdf"')
+    })
+
+    it('should quote an ASCII filename', () => {
+      const data = new Email({
+        ...base,
+        attachments: [{ filename: 'test.txt', content: 'QQ==' }],
+      }).getEmailData()
+
+      expect(data).toContain('filename="test.txt"')
+    })
+  })
+
+  describe('estimateSize', () => {
+    it('should account for the base64 overhead of attachments', () => {
+      const email = new Email({
+        from: 'sender@example.com',
+        to: 'recipient@example.com',
+        subject: 'Test',
+        text: 'Hello',
+        attachments: [{ filename: 'big.bin', content: new Uint8Array(30_000) }],
+      })
+      expect(email.estimateSize()).toBeGreaterThan(40_000)
+    })
   })
 
   describe('sent promise', () => {
