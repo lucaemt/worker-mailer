@@ -11,7 +11,7 @@
     "email",
     "smtp"
   ],
-  "author": "zou-yu",
+  "author": "zou-yu, lucaemt",
   "repository": {
     "type": "git",
     "url": "https://github.com/zou-yu/worker-mailer.git"
