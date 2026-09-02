@@ -43,4 +43,4 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         uses: changesets/action@v1
         with:
-          publish: pnpm publish --no-git-checks
+          publish: pnpm publish --access public --no-git-checks
